@@ -1,0 +1,12 @@
+//| mill-version: 1.0.0-RC2-68-43069c
+
+import mill.*, scalanativelib.*
+import mill.define.Task.Simple
+
+val scalaVersions = Seq("3.3.6", "2.13.16")
+
+object core extends Cross[CoreLib](scalaVersions)
+
+trait CoreLib extends Cross.Module[String] with ScalaNativeModule:
+  def scalaVersion = crossValue
+  def scalaNativeVersion: Simple[String] = "0.5.8"
