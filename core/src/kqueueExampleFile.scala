@@ -21,11 +21,7 @@ import java.io.IOException
   * example
   */
 object KQueueExampleFile {
-  def main(args: Array[String]): Unit = {
-    if (args.length != 1) {
-      println("Usage: KQueueExampleFile <file-path>")
-      return
-    }
+  def run(fifo: String): Unit = {
     val kq = event.kqueue()
     try {
       if (kq < 0) {
@@ -34,8 +30,8 @@ object KQueueExampleFile {
         )
       }
       val fd = Zone.acquire { implicit z =>
-        println(s"attempt to open file ${args(0)}")
-        val path = toCString(args(0))
+        println(s"attempt to open file ${fifo}")
+        val path = toCString(fifo)
         fcntl.open(path, fcntl.O_RDONLY | fcntl.O_NONBLOCK)
       }
       if (fd < 0) {
@@ -43,7 +39,7 @@ object KQueueExampleFile {
           s"Failed to open file: ${fromCString(string.strerror(errno.errno))}"
         )
       }
-      println(s"opened file descriptor: $fd (file: ${args(0)})")
+      println(s"opened file descriptor: $fd (file: ${fifo})")
       val changeEvent = stackalloc[event.kevent]()
       event.EV_SET(
         changeEvent,
