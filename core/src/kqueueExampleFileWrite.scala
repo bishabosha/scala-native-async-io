@@ -20,8 +20,8 @@ import java.io.IOException
 /** actually useless for "real" files, it always blocks, so use with a FIFO for
   * example
   */
-object KQueueExampleFile {
-  def run(fifo: String): Unit = {
+object KQueueExampleFileWrite {
+  def run(fifo: String, msg0: String): Unit = {
     val kq = event.kqueue()
     try {
       if (kq < 0) {
@@ -32,7 +32,7 @@ object KQueueExampleFile {
       val fd = Zone.acquire { implicit z =>
         println(s"attempt to open file ${fifo}")
         val path = toCString(fifo)
-        fcntl.open(path, fcntl.O_RDONLY | fcntl.O_NONBLOCK)
+        fcntl.open(path, fcntl.O_WRONLY | fcntl.O_NONBLOCK)
       }
       if (fd < 0) {
         throw new IOException(
@@ -44,7 +44,7 @@ object KQueueExampleFile {
       event.EV_SET(
         changeEvent,
         fd.toUSize, // file descriptor
-        event.EVFILT_READ, // filter type
+        event.EVFILT_WRITE, // filter type
         (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort, // flags
         0.toUInt, // fflags
         0, // timeout in seconds
@@ -57,14 +57,9 @@ object KQueueExampleFile {
       } else {
         println("Event registered for file read.")
       }
-      var byteArray = new Array[Byte](1024)
-      var offset = 0
-      def dbl() = {
-        byteArray = new Array[Byte](byteArray.length * 2)
-      }
-      val timeout = stackalloc[timespec]()
-      timeout.tv_sec = 1 // seconds
-      timeout.tv_nsec = 0 // nanoseconds
+      // val timeout = stackalloc[timespec]()
+      // timeout.tv_sec = 1 // seconds
+      // timeout.tv_nsec = 0 // nanoseconds
       val polledEvents = stackalloc[event.kevent]()
       try {
         while (true) {
@@ -73,7 +68,7 @@ object KQueueExampleFile {
             s"starting to poll..."
           )
           val nev =
-            event.kevent(kq, null, 0, polledEvents, 1, timeout) // infinite wait
+            event.kevent(kq, null, 0, polledEvents, 1, null) // infinite wait
           if (nev < 0) {
             throw new IOException(
               s"Failed to wait for event: ${fromCString(string.strerror(errno.errno))}"
@@ -85,45 +80,41 @@ object KQueueExampleFile {
               s"Event triggered: ID = ${polledEvents.ident}, Filter = ${polledEvents.filter}, Data = ${polledEvents.data}"
             )
             assert(
-              polledEvents.filter == event.EVFILT_READ && polledEvents.ident == fd.toUSize
+              polledEvents.filter == event.EVFILT_WRITE && polledEvents.ident == fd.toUSize
             )
             val available = polledEvents.data.toInt
-            println(s"Bytes available to read: $available")
+            println(s"Bytes available to write: $available")
             polledEvents(0) = null // Reset the event
-
+            val msg = msg0.getBytes()
+            assert(
+              msg.length <= available,
+              s"Message length (${msg.length}) exceeds available bytes ($available)"
+            )
             var continue = true
             while (continue) {
               // read all data until EOF or EAGAIN
-              var bytesRead = unistd.read(
+              val buf = msg.at(0)
+              var bytesWritten = unistd.write(
                 fd,
-                byteArray.at(offset),
-                (1024 `min` (byteArray.length - offset)).toCSize
+                buf,
+                msg.length.toCSize
               )
-              if (bytesRead < 0) {
+              if (bytesWritten < 0) {
                 if (
                   errno.errno != perrno.EAGAIN && errno.errno != perrno.EWOULDBLOCK
                 ) {
                   throw new IOException(
-                    s"Failed to read file: ${fromCString(string.strerror(errno.errno))}"
+                    s"Failed to write file: ${fromCString(string.strerror(errno.errno))}"
                   )
                 } else {
                   println(
-                    "No more data available to read (EAGAIN or EWOULDBLOCK)."
+                    "No data available to write (EAGAIN or EWOULDBLOCK)."
                   )
                   continue = false // Exit the loop if no more data is available
                 }
-              } else if (bytesRead == 0) {
-                println(s"End of file reached. Contents are $offset long.")
-                println(
-                  s"File contents: `${new String(byteArray.take(offset))}`"
-                )
-                return // Exit if no data is read
               } else {
-                println(s"actually read $bytesRead bytes")
-                offset += bytesRead.toInt
-                if (offset >= byteArray.length) {
-                  dbl()
-                }
+                println(s"actually wrote $bytesWritten bytes")
+                return // Exit after writing the message
               }
             }
           }

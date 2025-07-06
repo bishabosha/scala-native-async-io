@@ -4,8 +4,12 @@ import mainargs.{main, ParserForMethods, arg}
 
 object Main {
   @main
-  def file(@arg fifo: String): Unit = {
-    KQueueExampleFile.run(fifo)
+  def fileRead(@arg fifo: String): Unit = {
+    KQueueExampleFileRead.run(fifo)
+  }
+  @main
+  def fileWrite(@arg fifo: String, @arg(short='m') message: String): Unit = {
+    KQueueExampleFileWrite.run(fifo, message)
   }
   @main
   def timer(): Unit = {
