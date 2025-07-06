@@ -57,6 +57,9 @@ int16_t asyncio_scalanative_EVFILT_EXCEPT() {
 int16_t asyncio_scalanative_EVFILT_TIMER() {
   return EVFILT_TIMER;
 }
+int16_t asyncio_scalanative_EVFILT_WRITE() {
+  return EVFILT_WRITE;
+}
 
 // notes
 int32_t asyncio_scalanative_NOTE_SECONDS() {

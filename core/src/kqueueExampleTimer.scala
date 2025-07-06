@@ -11,8 +11,8 @@ import scala.scalanative.posix.unistd
 import scala.scalanative.posix.time.timespec
 import scala.scalanative.posix.timeOps._
 
-object Foo {
-  def main(args: Array[String]): Unit = {
+object KQueueExampleTimer {
+  def run(): Unit = {
     val kq = event.kqueue()
     try {
       if (kq < 0) {
