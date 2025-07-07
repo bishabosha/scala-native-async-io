@@ -1,4 +1,4 @@
-//| mill-version: 1.0.0-RC2-68-43069c
+//| mill-version: 1.0.0-RC3-31-eb2d11
 
 import mill.scalalib.*
 import mill.*, scalanativelib.*
@@ -10,8 +10,8 @@ object core extends Cross[CoreLib](scalaVersions)
 
 trait CoreLib extends Cross.Module[String] with ScalaNativeModule:
   def scalaVersion = crossValue
-  def scalaNativeVersion: Simple[String] = "0.5.8"
+  def scalaNativeVersion = "0.5.8"
 
-  override def mvnDeps: Simple[Seq[Dep]] = super.mvnDeps() ++ Seq(
+  def mvnDeps = Seq(
     mvn"com.lihaoyi::mainargs::0.7.6"
   )
