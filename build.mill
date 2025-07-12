@@ -1,8 +1,8 @@
-//| mill-version: 1.0.0-RC3-31-eb2d11
+//| mill-version: 1.0.0
 
 import mill.scalalib.*
 import mill.*, scalanativelib.*
-import mill.define.Task.Simple
+import mill.api.Task.Simple
 
 val scalaVersions = Seq("3.3.6", "2.13.16")
 
@@ -11,7 +11,13 @@ object core extends Cross[CoreLib](scalaVersions)
 trait CoreLib extends Cross.Module[String] with ScalaNativeModule:
   def scalaVersion = crossValue
   def scalaNativeVersion = "0.5.8"
-
   def mvnDeps = Seq(
     mvn"com.lihaoyi::mainargs::0.7.6"
   )
+
+  override def scalacOptions: Simple[Seq[String]] = Task {
+    if scalaVersion().startsWith("3") then
+      Seq.empty
+    else
+      Seq("-Xsource:3")
+  }
