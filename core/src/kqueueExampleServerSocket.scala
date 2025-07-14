@@ -50,6 +50,12 @@ object KQueueExampleServerSocket {
           val addr = z.alloc(sizeOf[un.sockaddr_un]).asInstanceOf[Ptr[un.sockaddr_un]]
           addr.sun_family = socket.AF_UNIX.toUShort
           val path = toCString(sock)
+          val rmErr = unistd.unlink(path) // remove the socket file if it already exists
+          if (rmErr < 0 && errno.errno != perrno.ENOENT) {
+            throw new IOException(
+              s"Failed to unlink existing socket at $sock: ${fromCString(string.strerror(errno.errno))}"
+            )
+          }
           string.strncpy(addr.sun_path.at(0), path, (sizeof[un._108] - 1.toCSize).min(string.strlen(path)))
           val err0 = socket.bind(fd, addr.asInstanceOf[Ptr[socket.sockaddr]], sizeOf[un.sockaddr_un].toUInt)
           if (err0 < 0) {
@@ -58,18 +64,18 @@ object KQueueExampleServerSocket {
             )
           }
         }
-        sys.addShutdownHook {
-          // SIGINT bypasses finally blocks, so all cleanup must be done here
-          val res = Zone.acquire { implicit z =>
-            val path = toCString(sock)
-            unistd.unlink(path)
-          }
-          if (res < 0) {
-            throw new IOException(
-              s"Failed to unlink socket: ${fromCString(string.strerror(errno.errno))}"
-            )
-          }
-        }
+        // sys.addShutdownHook {
+        //   // SIGINT bypasses finally blocks, so all cleanup must be done here
+        //   val res = Zone.acquire { implicit z =>
+        //     val path = toCString(sock)
+        //     unistd.unlink(path)
+        //   }
+        //   if (res < 0) {
+        //     throw new IOException(
+        //       s"Failed to unlink socket: ${fromCString(string.strerror(errno.errno))}"
+        //     )
+        //   }
+        // }
         println(s"bound socket to path: $sock")
         val listenRes = socket.listen(fd, socket.SOMAXCONN) // Listen for incoming connections
         if (listenRes < 0) {
