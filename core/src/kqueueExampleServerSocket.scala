@@ -46,17 +46,24 @@ object KQueueExampleServerSocket {
           )
         }
         println(s"opened file descriptor: $fd (socket-type)")
+        val maxPathLength = sizeOf[CArray[CChar, un._108]] - 1
+        if (sock.length > maxPathLength) {
+          throw new IOException(
+            s"Socket path exceeds maximum length of $maxPathLength characters: $sock"
+          )
+        }
         Zone.acquire { implicit z =>
+          val path = toCString(sock)
           val addr = z.alloc(sizeOf[un.sockaddr_un]).asInstanceOf[Ptr[un.sockaddr_un]]
           addr.sun_family = socket.AF_UNIX.toUShort
-          val path = toCString(sock)
           val rmErr = unistd.unlink(path) // remove the socket file if it already exists
           if (rmErr < 0 && errno.errno != perrno.ENOENT) {
             throw new IOException(
               s"Failed to unlink existing socket at $sock: ${fromCString(string.strerror(errno.errno))}"
             )
           }
-          string.strncpy(addr.sun_path.at(0), path, (sizeof[un._108] - 1.toCSize).min(string.strlen(path)))
+          string.memcpy(addr.sun_path.at(0), path, sock.length.toCSize)
+          addr.sun_path(sock.length) = 0.toByte // null-terminate the path
           val err0 = socket.bind(fd, addr.asInstanceOf[Ptr[socket.sockaddr]], sizeOf[un.sockaddr_un].toUInt)
           if (err0 < 0) {
             throw new IOException(
@@ -116,6 +123,54 @@ object KQueueExampleServerSocket {
           byteArray = new Array[Byte](byteArray.length * 2)
         }
         reset() // initialize the byte array
+        object states {
+          type EventState = Int
+          val ReadClientMessage: EventState = 0
+          val ReadClientHeader: EventState = 1
+          val SendResponse: EventState = 2
+          val SendResponseHeader: EventState = 3
+        }
+        var eventStates: Map[Int, states.EventState] = Map.empty[Int, states.EventState]
+        var eventHeaders: Map[Int, states.EventState] = Map.empty[Int, Int]
+        // var bufferedWrites: Map[Int, Int] = Map.empty[Int, Int]
+        def closeClient(clientFd: Int): Unit = {
+          val writeExpected = eventStates.get(clientFd).contains(states.SendResponse)
+          clientFds -= clientFd
+          eventStates -= clientFd
+          eventHeaders -= clientFd
+          Zone.acquire { implicit z =>
+            val len = if (writeExpected) 2 else 1
+            val clientEvents = z.alloc(sizeOf[event.kevent] * len).asInstanceOf[Ptr[event.kevent]]
+            event.EV_SET(
+              clientEvents,
+              clientFd.toUSize, // file descriptor
+              event.EVFILT_READ, // filter type
+              event.EV_DELETE.toUShort, // flags
+              0.toUInt, // fflags
+              0, // data
+              null // udata
+            )
+            if (writeExpected) {
+              // If we expect a write event, also remove it
+              event.EV_SET(
+                clientEvents + 1,
+                clientFd.toUSize, // file descriptor
+                event.EVFILT_WRITE, // filter type
+                event.EV_DELETE.toUShort, // flags
+                0.toUInt, // fflags
+                0, // data
+                null // udata
+              )
+            }
+            if (event.kevent(kq, clientEvents, len, null, 0, null) < 0) {
+              throw new IOException(
+                s"Failed to clear client events: ${fromCString(string.strerror(errno.errno))}"
+              )
+            }
+          }
+          deregisterBuf += clientFd
+          println(s"Deregistering client socket: $clientFd")
+        }
         var doPoll = true
         while (doPoll) {
           println(s"starting to poll...")
@@ -133,7 +188,7 @@ object KQueueExampleServerSocket {
               val sockFd = evt.ident.toInt
               if (sockFd == fd) {
                 assert(evt.filter == event.EVFILT_READ)
-                println("server socket ready for accept.")
+                println("@@@ server socket ready for accept.")
                 val clientFd = socket.accept(fd, null, null)
                 if (clientFd < 0) {
                   throw new IOException(
@@ -142,30 +197,24 @@ object KQueueExampleServerSocket {
                 }
                 println(s"Accepted new client connection on fd: $clientFd")
                 clientFds += clientFd
+                eventStates += (clientFd -> states.ReadClientHeader) // Initialize the event state for the new client
                 // Register the new client socket for read events
-                val clientEvents = stackalloc[event.kevent](2)
-                event.EV_SET(
-                  clientEvents,
-                  clientFd.toUSize, // file descriptor
-                  event.EVFILT_READ, // filter type
-                  (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort, // flags
-                  0.toUInt, // fflags
-                  0, // data
-                  null // udata
-                )
-                event.EV_SET(
-                  clientEvents + 1,
-                  clientFd.toUSize, // file descriptor
-                  event.EVFILT_WRITE, // filter type
-                  (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort, // flags
-                  0.toUInt, // fflags
-                  0, // data
-                  null // udata
-                )
-                if (event.kevent(kq, clientEvents, 2, null, 0, null) < 0) {
-                  throw new IOException(
-                    s"Failed to register client event: ${fromCString(string.strerror(errno.errno))}"
+                Zone.acquire { implicit z =>
+                  val clientEvents = z.alloc(sizeOf[event.kevent]).asInstanceOf[Ptr[event.kevent]]
+                  event.EV_SET(
+                    clientEvents,
+                    clientFd.toUSize, // file descriptor
+                    event.EVFILT_READ, // filter type
+                    (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort, // flags
+                    0.toUInt, // fflags
+                    0, // data
+                    null // udata
                   )
+                  if (event.kevent(kq, clientEvents, 1, null, 0, null) < 0) {
+                    throw new IOException(
+                      s"Failed to register client read event: ${fromCString(string.strerror(errno.errno))}"
+                    )
+                  }
                 }
                 println(s"Registered client socket $clientFd for read and write events.")
               } else {
@@ -178,16 +227,9 @@ object KQueueExampleServerSocket {
                   val isErr = (evt.flags & event.EV_ERROR) != 0
                   if (isErr) {
                     println(s"Error on client socket $clientFd: ${fromCString(string.strerror(evt.data.toInt))}")
-                    clientFds -= clientFd
-                    if (unistd.close(clientFd) < 0) {
-                      throw new IOException(
-                        s"Failed to close client socket $clientFd: ${fromCString(string.strerror(errno.errno))}"
-                      )
-                    }
-                    println(s"Closed client socket $clientFd due to error.")
-                  } else {
-                    val noun = if (evt.filter == event.EVFILT_READ) "read" else "write"
-                    println(s"client socket $clientFd ready for $noun.")
+                    closeClient(clientFd)
+                  } else if (evt.filter == event.EVFILT_READ) {
+                    println(s"<<< client socket $clientFd ready for read.")
                     val available = evt.data.toInt
                     var continue = true
                     while (continue) {
@@ -196,6 +238,51 @@ object KQueueExampleServerSocket {
                         byteArray.at(offset),
                         (1024 `min` (byteArray.length - offset)).toCSize
                       )
+
+                      def processEnd(): Unit = {
+                        val state = eventStates(clientFd)
+                        if (state == states.ReadClientHeader) {
+                          if (offset != 4) {
+                            println(s"Unexpected EOF while reading header from client socket $clientFd. Expected 4 bytes, got $offset bytes.")
+                            closeClient(clientFd)
+                          } else {
+                            println(s"Read header of size 4 bytes from client socket $clientFd.")
+                            val size = byteArray.take(4).foldLeft(0)((acc, b) => (acc << 8) | (b & 0xFF))
+                            println(s"message size: $size bytes")
+                            eventHeaders += (clientFd -> size)
+                            println("Now waiting for message body...")
+                            eventStates += (clientFd -> states.ReadClientMessage)
+                          }
+                        } else if (state == states.ReadClientMessage) {
+                          val expected = eventHeaders(clientFd)
+                          assert(offset == expected, "Unexpected EOF while reading message. [TODO: handle larger messages]")
+                          println(s"Read message of size $offset bytes from client socket $clientFd.")
+                          println(s"message contents: `${new String(byteArray.take(offset))}`")
+                          eventStates -= clientFd
+                          eventHeaders -= clientFd
+                          eventStates += (clientFd -> states.SendResponse) // Prepare to send response
+                          // Register the client socket for write events
+                          Zone.acquire { implicit z =>
+                            val clientEvents = z.alloc(sizeOf[event.kevent]).asInstanceOf[Ptr[event.kevent]]
+                            event.EV_SET(
+                              clientEvents,
+                              clientFd.toUSize, // file descriptor
+                              event.EVFILT_WRITE, // filter type
+                              (event.EV_ADD | event.EV_ENABLE).toUShort, // flags
+                              0.toUInt, // fflags
+                              0, // data
+                              null // udata
+                            )
+                            if (event.kevent(kq, clientEvents, 1, null, 0, null) < 0) {
+                              throw new IOException(
+                                s"Failed to register client write event: ${fromCString(string.strerror(errno.errno))}"
+                              )
+                            }
+                          }
+                        }
+                        reset() // Reset the byte array for the next read
+                      }
+
                       if (bytesRead < 0) {
                         if (errno.errno != perrno.EAGAIN && errno.errno != perrno.EWOULDBLOCK) {
                           throw new IOException(
@@ -203,16 +290,15 @@ object KQueueExampleServerSocket {
                           )
                         } else {
                           println("No more data available to read (EAGAIN or EWOULDBLOCK).")
+                          processEnd()
                           continue = false // Exit the loop if no more data is available
                         }
                       } else if (bytesRead == 0) {
                         println(s"End of file reached on client socket $clientFd. Contents are $offset long.")
-                        println(s"message contents: `${new String(byteArray.take(offset))}`")
-                        // TODO: send the message back to the client?
-                        reset() // Reset the byte array for the next read
-                        deregisterBuf += clientFd
-                        println(s"will deregister client socket $clientFd after polling due to EOF.")
+                        processEnd()
                         continue = false // Exit the loop if no more data is available
+                        // deregisterBuf += clientFd
+                        // println(s"will deregister client socket $clientFd after polling due to EOF.")
                         // for now, accept more connections, else // doPoll = false
                       } else {
                         println(s"Actually read $bytesRead bytes from client socket $clientFd")
@@ -222,6 +308,21 @@ object KQueueExampleServerSocket {
                         }
                       }
                     }
+                  } else {
+                    assert(evt.filter == event.EVFILT_WRITE, s"Unexpected filter: ${evt.filter}")
+                    println(s">>> client socket $clientFd ready for write.")
+                    if (eventStates.get(clientFd).contains(states.SendResponse)) {
+                      println(s"Socket $clientFd is in SendResponse state, writing response.")
+                      val bytes = "Just pinging back!\n".getBytes()
+                      val bytesWritten = unistd.write(clientFd, bytes.at(0), bytes.length.toCSize)
+                      if (bytesWritten < 0) {
+                        throw new IOException(s"Failed to write to socket: ${fromCString(string.strerror(perrno.errno))}")
+                      }
+                      println(s"Wrote $bytesWritten bytes to socket $clientFd.")
+                      closeClient(clientFd) // Close the client socket after sending the response
+                    } else {
+                      println(s"Socket $clientFd is not in SendResponse state, skipping write.")
+                    }
                   }
                 }
               }
@@ -230,8 +331,7 @@ object KQueueExampleServerSocket {
           }
           if (deregisterBuf.nonEmpty) {
             for (clientFd <- deregisterBuf) {
-              println("Deregistering client socket: " + clientFd)
-              clientFds -= clientFd
+              println("Closing deregistered client socket: " + clientFd)
               if (unistd.close(clientFd) < 0) {
                 throw new IOException(
                   s"Failed to close client socket $clientFd: ${fromCString(string.strerror(errno.errno))}"
@@ -241,102 +341,6 @@ object KQueueExampleServerSocket {
             deregisterBuf = Set.empty[Int]
           }
         }
-
-        // val changeEvent = stackalloc[event.kevent]()
-        // event.EV_SET(
-        //   changeEvent,
-        //   fd.toUSize, // file descriptor
-        //   event.EVFILT_READ, // filter type
-        //   (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort, // flags
-        //   0.toUInt, // fflags
-        //   0, // timeout in seconds
-        //   null // data
-        // )
-        // if (event.kevent(kq, changeEvent, 1, null, 0, null) < 0) {
-        //   throw new IOException(
-        //     s"Failed to register event: ${fromCString(string.strerror(errno.errno))}"
-        //   )
-        // } else {
-        //   println("Event registered for file read.")
-        // }
-        // var byteArray = null.asInstanceOf[Array[Byte]]
-        // def reset() = {
-        //   byteArray = new Array[Byte](1024)
-        // }
-        // var offset = 0
-        // def dbl() = {
-        //   offset = 0
-        //   byteArray = new Array[Byte](byteArray.length * 2)
-        // }
-        // // val timeout = stackalloc[timespec]()
-        // // timeout.tv_sec = 1 // seconds
-        // // timeout.tv_nsec = 0 // nanoseconds
-        // val polledEvents = stackalloc[event.kevent]()
-        // reset() // initialize the byte array
-        // try {
-        //   while (true) {
-        //     // Wait for the event to be triggered
-        //     println(
-        //       s"starting to poll..."
-        //     )
-        //     val nev =
-        //       event.kevent(kq, null, 0, polledEvents, 1, null) // infinite wait
-        //     if (nev < 0) {
-        //       throw new IOException(
-        //         s"Failed to wait for event: ${fromCString(string.strerror(errno.errno))}"
-        //       )
-        //     } else if (nev == 0) {
-        //       println("No events triggered within the timeout period.")
-        //     } else {
-        //       println(
-        //         s"Event triggered: ID = ${polledEvents.ident}, Filter = ${polledEvents.filter}, Data = ${polledEvents.data}"
-        //       )
-        //       assert(
-        //         polledEvents.filter == event.EVFILT_READ && polledEvents.ident == fd.toUSize
-        //       )
-        //       val available = polledEvents.data.toInt
-        //       val atEOF = (polledEvents.flags & event.EV_EOF) != 0
-        //       println(s"Bytes available to read: $available (atEOF: $atEOF)")
-
-        //       var continue = true
-        //       while (continue) {
-        //         // read all data until EOF or EAGAIN
-        //         var bytesRead = unistd.read(
-        //           fd,
-        //           byteArray.at(offset),
-        //           (1024 `min` (byteArray.length - offset)).toCSize
-        //         )
-        //         if (bytesRead < 0) {
-        //           if (
-        //             errno.errno != perrno.EAGAIN && errno.errno != perrno.EWOULDBLOCK
-        //           ) {
-        //             throw new IOException(
-        //               s"Failed to read file: ${fromCString(string.strerror(errno.errno))}"
-        //             )
-        //           } else {
-        //             println(
-        //               "No more data available to read (EAGAIN or EWOULDBLOCK)."
-        //             )
-        //             continue = false // Exit the loop if no more data is available
-        //           }
-        //         } else if (bytesRead == 0) {
-        //           println(s"End of file reached. Contents are $offset long.")
-        //           println(
-        //             s"File contents: `${new String(byteArray.take(offset))}`"
-        //           )
-        //           reset() // Reset the byte array for the next read
-        //           continue = false // Exit the loop if no more data is available
-        //         } else {
-        //           println(s"actually read $bytesRead bytes")
-        //           offset += bytesRead.toInt
-        //           if (offset >= byteArray.length) {
-        //             dbl()
-        //           }
-        //         }
-        //       }
-        //     }
-        //   }
-        // }
       } finally {
         val st = unistd.close(fd)
         if (st < 0) {
