@@ -4,20 +4,37 @@ import mill.scalalib.*
 import mill.*, scalanativelib.*
 import mill.api.Task.Simple
 
-val scalaVersions = Seq("3.3.6", "2.13.16")
+val scala3Version = "3.3.6"
+val scala213Version = "2.13.16"
+val scala212Version = "2.12.20"
+val scalaVersions = Seq(scala3Version, scala213Version, scala212Version)
 
-object core extends Cross[CoreLib](scalaVersions)
-
-trait CoreLib extends Cross.Module[String] with ScalaNativeModule:
-  def scalaVersion = crossValue
+trait CommonScalaNative extends ScalaNativeModule:
   def scalaNativeVersion = "0.5.8"
-  def mvnDeps = Seq(
-    mvn"com.lihaoyi::mainargs::0.7.6"
-  )
-
-  override def scalacOptions: Simple[Seq[String]] = Task {
+  def scalacOptions = Task {
     if scalaVersion().startsWith("3") then
       Seq.empty
     else
       Seq("-Xsource:3")
   }
+
+/** Library to provide high performance asynchronous I/O */
+object asyncio extends Cross[AsyncIO](scalaVersions)
+
+trait AsyncIO extends Cross.Module[String]:
+  trait AsyncIOModule extends CrossScalaModule with CommonScalaNative with CrossValue
+
+  /** Defines raw OS-level primitives, no abstraction */
+  object core extends AsyncIOModule
+
+  /** Provides higher-level abstractions over the top of core primitives */
+  object loop extends AsyncIOModule:
+    def moduleDeps = Seq(core)
+
+/** Experimental exploration of OS-level abstractions */
+object demo extends CommonScalaNative:
+  def scalaVersion = scala3Version
+  def moduleDeps = Seq(asyncio(scala3Version).loop)
+  def mvnDeps = Seq(
+    mvn"com.lihaoyi::mainargs::0.7.6"
+  )

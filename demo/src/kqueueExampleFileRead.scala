@@ -16,19 +16,15 @@ import scala.scalanative.posix.timeOps._
 import scala.scalanative.posix.fcntl
 import scala.scalanative.unsafe.Zone
 import java.io.IOException
+import asyncio.unsafe.KqueueLoop
+import asyncio.unsafe.Bracket
 
 /** actually useless for "real" files, it always blocks, so use with a FIFO for
   * example
   */
 object KQueueExampleFileRead {
   def run(fifo: String): Unit = {
-    val kq = event.kqueue()
-    try {
-      if (kq < 0) {
-        throw new IOException(
-          s"Failed to create kqueue: ${fromCString(string.strerror(errno.errno))}"
-        )
-      }
+    Bracket.fileResource(KqueueLoop.open())(KqueueLoop.close) { kq =>
       val fd = Zone.acquire { implicit z =>
         println(s"attempt to open file ${fifo}")
         val path = toCString(fifo)
@@ -141,13 +137,6 @@ object KQueueExampleFileRead {
             s"Failed to close file descriptor: ${fromCString(string.strerror(errno.errno))}"
           )
         }
-      }
-    } finally {
-      val st = unistd.close(kq)
-      if (st < 0) {
-        throw new IOException(
-          s"Failed to close kqueue: ${fromCString(string.strerror(errno.errno))}"
-        )
       }
     }
   }

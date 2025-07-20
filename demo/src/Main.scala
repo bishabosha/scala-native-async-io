@@ -27,7 +27,8 @@ object Main {
   def echo(@arg msg: String): Unit = {
     println(msg)
   }
-  @main def targetInfo(): Unit = {
+  @main
+  def targetInfo(): Unit = {
     (
       s"target.arch: ${scalanative.meta.LinktimeInfo.target.arch}",
       s"target.vendor: ${scalanative.meta.LinktimeInfo.target.vendor}",

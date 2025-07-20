@@ -1,9 +1,10 @@
 package example
 
+import asyncio.unsafe.KqueueLoop
+
 import asyncio.scalanative.bsd.sys.event
 import asyncio.scalanative.bsd.sys.event.kevent.KEventOps
-import scala.scalanative.libc.errno
-import scala.scalanative.posix.{errno => perrno}
+import scala.scalanative.posix.errno
 import scala.scalanative.libc.string
 import scala.scalanative.unsafe.fromCString
 import scala.scalanative.unsafe.UnsafeRichArray
@@ -22,93 +23,26 @@ import scala.scalanative.posix.sys.unOps.{*, given}
 import scala.scalanative.unsafe.Zone
 import java.io.IOException
 import scala.scalanative.unsafe.Ptr
+import asyncio.unsafe.Bracket
+import asyncio.unsafe.PosixSockets
+import asyncio.unsafe.Sockets.Flavor
+import asyncio.unsafe.Sockets
+import asyncio.unsafe.Sockets.Transport
+import asyncio.unsafe.PosixFileOps
 
 object KQueueExampleServerSocket {
   def run(sock: String): Unit = {
-    val kq = event.kqueue()
-    if (kq < 0) {
-      throw new IOException(
-        s"Failed to create kqueue: ${fromCString(string.strerror(errno.errno))}"
-      )
-    }
-    try {
-      val fd = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
-      if (fd < 0) {
-        throw new IOException(
-          s"Failed to open file: ${fromCString(string.strerror(errno.errno))}"
-        )
-      }
-      try {
-        val err = fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.O_NONBLOCK)
-        if (err < 0) {
-          throw new IOException(
-            s"Failed to set socket descriptor to non-blocking: ${fromCString(string.strerror(errno.errno))}"
-          )
-        }
+    Bracket.fileResource(KqueueLoop.open())(KqueueLoop.close) { kq =>
+      Bracket.fileResource(PosixSockets.open(Flavor.Unix, Transport.Stream, blocking = false))(PosixSockets.close) { fd =>
         println(s"opened file descriptor: $fd (socket-type)")
-        val maxPathLength = sizeOf[CArray[CChar, un._108]] - 1
-        if (sock.length > maxPathLength) {
-          throw new IOException(
-            s"Socket path exceeds maximum length of $maxPathLength characters: $sock"
-          )
-        }
-        Zone.acquire { implicit z =>
-          val path = toCString(sock)
-          val addr = z.alloc(sizeOf[un.sockaddr_un]).asInstanceOf[Ptr[un.sockaddr_un]]
-          addr.sun_family = socket.AF_UNIX.toUShort
-          val rmErr = unistd.unlink(path) // remove the socket file if it already exists
-          if (rmErr < 0 && errno.errno != perrno.ENOENT) {
-            throw new IOException(
-              s"Failed to unlink existing socket at $sock: ${fromCString(string.strerror(errno.errno))}"
-            )
-          }
-          string.memcpy(addr.sun_path.at(0), path, sock.length.toCSize)
-          addr.sun_path(sock.length) = 0.toByte // null-terminate the path
-          val err0 = socket.bind(fd, addr.asInstanceOf[Ptr[socket.sockaddr]], sizeOf[un.sockaddr_un].toUInt)
-          if (err0 < 0) {
-            throw new IOException(
-              s"Failed to bind socket: ${fromCString(string.strerror(errno.errno))}"
-            )
-          }
-        }
-        // sys.addShutdownHook {
-        //   // SIGINT bypasses finally blocks, so all cleanup must be done here
-        //   val res = Zone.acquire { implicit z =>
-        //     val path = toCString(sock)
-        //     unistd.unlink(path)
-        //   }
-        //   if (res < 0) {
-        //     throw new IOException(
-        //       s"Failed to unlink socket: ${fromCString(string.strerror(errno.errno))}"
-        //     )
-        //   }
-        // }
+        PosixSockets.bindUnixAddr(fd, sock, removeExisting = true)
         println(s"bound socket to path: $sock")
-        val listenRes = socket.listen(fd, socket.SOMAXCONN) // Listen for incoming connections
-        if (listenRes < 0) {
-          throw new IOException(
-            s"Failed to listen on socket: ${fromCString(string.strerror(errno.errno))}"
-          )
-        }
+        PosixSockets.listen(fd, PosixSockets.maxConnections)
         println("Socket is now listening for connections.")
-        // set up kqueue for the socket
-        val changeEvent = stackalloc[event.kevent]()
-        event.EV_SET(
-          changeEvent,
-          fd.toUSize, // file descriptor
-          event.EVFILT_READ, // filter type
-          (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort, // flags
-          0.toUInt, // fflags
-          0, // timeout in seconds
-          null // data
-        )
-        if (event.kevent(kq, changeEvent, 1, null, 0, null) < 0) {
-          throw new IOException(
-            s"Failed to register event: ${fromCString(string.strerror(errno.errno))}"
-          )
-        } else {
-          println("Event registered for socket accept.")
+        KqueueLoop.createAndRegisterEvents(kq, 1) {
+          KqueueLoop.addFile(_, fd, read = true, clear = true)
         }
+        println("Event registered for socket accept.")
         val polledEvents = stackalloc[event.kevent](255)
         var clientFds: Set[Int] = Set.empty[Int]
         var deregisterBuf: Set[Int] = Set.empty[Int]
@@ -138,34 +72,10 @@ object KQueueExampleServerSocket {
           clientFds -= clientFd
           eventStates -= clientFd
           eventHeaders -= clientFd
-          Zone.acquire { implicit z =>
-            val len = if (writeExpected) 2 else 1
-            val clientEvents = z.alloc(sizeOf[event.kevent] * len).asInstanceOf[Ptr[event.kevent]]
-            event.EV_SET(
-              clientEvents,
-              clientFd.toUSize, // file descriptor
-              event.EVFILT_READ, // filter type
-              event.EV_DELETE.toUShort, // flags
-              0.toUInt, // fflags
-              0, // data
-              null // udata
-            )
+          KqueueLoop.createAndRegisterEvents(kq, if (writeExpected) 2 else 1) { clientEvents =>
+            KqueueLoop.deleteFile(clientEvents, clientFd, read = true)
             if (writeExpected) {
-              // If we expect a write event, also remove it
-              event.EV_SET(
-                clientEvents + 1,
-                clientFd.toUSize, // file descriptor
-                event.EVFILT_WRITE, // filter type
-                event.EV_DELETE.toUShort, // flags
-                0.toUInt, // fflags
-                0, // data
-                null // udata
-              )
-            }
-            if (event.kevent(kq, clientEvents, len, null, 0, null) < 0) {
-              throw new IOException(
-                s"Failed to clear client events: ${fromCString(string.strerror(errno.errno))}"
-              )
+              KqueueLoop.deleteFile(clientEvents + 1, clientFd, read = false)
             }
           }
           deregisterBuf += clientFd
@@ -174,12 +84,8 @@ object KQueueExampleServerSocket {
         var doPoll = true
         while (doPoll) {
           println(s"starting to poll...")
-          val events = event.kevent(kq, null, 0, polledEvents, 255, null) // infinite wait
-          if (events < 0) {
-            throw new IOException(
-              s"Failed to wait for event: ${fromCString(string.strerror(errno.errno))}"
-            )
-          } else if (events == 0) {
+          val events = KqueueLoop.pollEventsForever(kq, polledEvents, 255)
+          if (events == 0) {
             println("No events triggered within the timeout period.")
           } else {
             var i = 0
@@ -199,22 +105,8 @@ object KQueueExampleServerSocket {
                 clientFds += clientFd
                 eventStates += (clientFd -> states.ReadClientHeader) // Initialize the event state for the new client
                 // Register the new client socket for read events
-                Zone.acquire { implicit z =>
-                  val clientEvents = z.alloc(sizeOf[event.kevent]).asInstanceOf[Ptr[event.kevent]]
-                  event.EV_SET(
-                    clientEvents,
-                    clientFd.toUSize, // file descriptor
-                    event.EVFILT_READ, // filter type
-                    (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort, // flags
-                    0.toUInt, // fflags
-                    0, // data
-                    null // udata
-                  )
-                  if (event.kevent(kq, clientEvents, 1, null, 0, null) < 0) {
-                    throw new IOException(
-                      s"Failed to register client read event: ${fromCString(string.strerror(errno.errno))}"
-                    )
-                  }
+                KqueueLoop.createAndRegisterEvents(kq, 1) { evt =>
+                  KqueueLoop.addFile(evt, clientFd, read = true, clear = true)
                 }
                 println(s"Registered client socket $clientFd for read and write events.")
               } else {
@@ -262,29 +154,15 @@ object KQueueExampleServerSocket {
                           eventHeaders -= clientFd
                           eventStates += (clientFd -> states.SendResponse) // Prepare to send response
                           // Register the client socket for write events
-                          Zone.acquire { implicit z =>
-                            val clientEvents = z.alloc(sizeOf[event.kevent]).asInstanceOf[Ptr[event.kevent]]
-                            event.EV_SET(
-                              clientEvents,
-                              clientFd.toUSize, // file descriptor
-                              event.EVFILT_WRITE, // filter type
-                              (event.EV_ADD | event.EV_ENABLE).toUShort, // flags
-                              0.toUInt, // fflags
-                              0, // data
-                              null // udata
-                            )
-                            if (event.kevent(kq, clientEvents, 1, null, 0, null) < 0) {
-                              throw new IOException(
-                                s"Failed to register client write event: ${fromCString(string.strerror(errno.errno))}"
-                              )
-                            }
+                          KqueueLoop.createAndRegisterEvents(kq, 1) { evt =>
+                            KqueueLoop.addFile(evt, clientFd, read = false, clear = false)
                           }
                         }
                         reset() // Reset the byte array for the next read
                       }
 
                       if (bytesRead < 0) {
-                        if (errno.errno != perrno.EAGAIN && errno.errno != perrno.EWOULDBLOCK) {
+                        if (errno.errno != errno.EAGAIN && errno.errno != errno.EWOULDBLOCK) {
                           throw new IOException(
                             s"Failed to read from client socket: ${fromCString(string.strerror(errno.errno))}"
                           )
@@ -316,7 +194,7 @@ object KQueueExampleServerSocket {
                       val bytes = "Just pinging back!\n".getBytes()
                       val bytesWritten = unistd.write(clientFd, bytes.at(0), bytes.length.toCSize)
                       if (bytesWritten < 0) {
-                        throw new IOException(s"Failed to write to socket: ${fromCString(string.strerror(perrno.errno))}")
+                        throw new IOException(s"Failed to write to socket: ${fromCString(string.strerror(errno.errno))}")
                       }
                       println(s"Wrote $bytesWritten bytes to socket $clientFd.")
                       closeClient(clientFd) // Close the client socket after sending the response
@@ -341,20 +219,6 @@ object KQueueExampleServerSocket {
             deregisterBuf = Set.empty[Int]
           }
         }
-      } finally {
-        val st = unistd.close(fd)
-        if (st < 0) {
-          throw new IOException(
-            s"Failed to close file descriptor: ${fromCString(string.strerror(errno.errno))}"
-          )
-        }
-      }
-    } finally {
-      val st = unistd.close(kq)
-      if (st < 0) {
-        throw new IOException(
-          s"Failed to close kqueue: ${fromCString(string.strerror(errno.errno))}"
-        )
       }
     }
   }
