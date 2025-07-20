@@ -2,85 +2,47 @@ package example
 
 import asyncio.scalanative.bsd.sys.event
 import asyncio.scalanative.bsd.sys.event.kevent.KEventOps
+import asyncio.unsafe.Bracket
+import asyncio.unsafe.KqueueLoop
+import asyncio.unsafe.PosixSockets
+import asyncio.unsafe.Sockets
+import asyncio.unsafe.Sockets.Flavor
+import asyncio.unsafe.Sockets.Transport
+
+import java.io.IOException
 import scala.scalanative.libc.errno
-import scala.scalanative.posix.{errno => perrno}
 import scala.scalanative.libc.string
-import scala.scalanative.unsafe.fromCString
-import scala.scalanative.unsafe.UnsafeRichArray
-import scala.scalanative.unsafe.toCString
-import scala.scalanative.unsafe.stackalloc
-import scala.scalanative.unsafe.sizeOf
-import scala.scalanative.unsafe.*
-import scala.scalanative.unsigned.UnsignedRichInt
-import scala.scalanative.posix.unistd
-import scala.scalanative.posix.time.timespec
-import scala.scalanative.posix.timeOps._
+import scala.scalanative.posix.errno as perrno
 import scala.scalanative.posix.fcntl
 import scala.scalanative.posix.sys.socket
 import scala.scalanative.posix.sys.un
 import scala.scalanative.posix.sys.unOps.{*, given}
-import scala.scalanative.unsafe.Zone
-import java.io.IOException
+import scala.scalanative.posix.time.timespec
+import scala.scalanative.posix.timeOps.*
+import scala.scalanative.posix.unistd
+import scala.scalanative.unsafe.*
 import scala.scalanative.unsafe.Ptr
+import scala.scalanative.unsafe.UnsafeRichArray
+import scala.scalanative.unsafe.Zone
+import scala.scalanative.unsafe.fromCString
+import scala.scalanative.unsafe.sizeOf
+import scala.scalanative.unsafe.stackalloc
+import scala.scalanative.unsafe.toCString
 import scala.scalanative.unsigned.UInt
+import scala.scalanative.unsigned.UnsignedRichInt
 
 object KQueueExampleSocket {
   def run(sock: String): Unit = {
-    val kq = event.kqueue()
-    if (kq == -1) {
-      throw new IOException(s"Failed to create kqueue: ${fromCString(string.strerror(perrno.errno))}")
-    }
-    try {
-      val clientFd = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
-      if (clientFd < 0) {
-        throw new IOException(s"Failed to create socket: ${fromCString(string.strerror(perrno.errno))}")
-      }
-      try {
-        if (fcntl.fcntl(clientFd, fcntl.F_SETFL, fcntl.O_NONBLOCK) < 0) {
-          throw new IOException(s"Failed to set socket to non-blocking: ${fromCString(string.strerror(perrno.errno))}")
-        }
-        val kev = stackalloc[event.kevent](2)
-        event.EV_SET(
-          (kev + 0),
-          clientFd.toUInt,
-          event.EVFILT_WRITE.toShort,
-          (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort,
-          0.toUShort,
-          0,
-          null
-        )
-        event.EV_SET(
-          (kev + 1),
-          clientFd.toUInt,
-          event.EVFILT_READ.toShort,
-          (event.EV_ADD | event.EV_ENABLE | event.EV_CLEAR).toUShort,
-          0.toUShort,
-          0,
-          null
-        )
-        if (event.kevent(kq, kev, 2, null, 0, null) < 0) {
-          throw new IOException(s"Failed to register events: ${fromCString(string.strerror(perrno.errno))}")
+    Bracket.fileResource(KqueueLoop.open())(KqueueLoop.close) { kq =>
+      Bracket.fileResource(PosixSockets.open(Flavor.Unix, Transport.Stream, blocking = false))(PosixSockets.close) { clientFd =>
+        println(s"opened file descriptor: $clientFd (socket-type)")
+        PosixSockets.connectUnixAddr(clientFd, sock)
+        println(s"connection in progress to path: $sock")
+        KqueueLoop.createAndRegisterEvents(kq, 2) { events =>
+          KqueueLoop.addFile(events, clientFd, read = true, clear = true)
+          KqueueLoop.addFile(events + 1, clientFd, read = false, clear = true)
         }
         println("Event registered for socket write and read.")
-        println(s"opened file descriptor: $clientFd (socket-type)")
-        val maxPathLength = sizeOf[CArray[CChar, un._108]] - 1
-        if (sock.length > maxPathLength) {
-          throw new IOException(
-            s"Socket path exceeds maximum length of $maxPathLength characters: $sock"
-          )
-        }
-        Zone.acquire { implicit z =>
-          val addr = z.alloc(sizeOf[un.sockaddr_un]).asInstanceOf[Ptr[un.sockaddr_un]]
-          addr.sun_family = socket.AF_UNIX.toUShort
-          val path = toCString(sock)
-          string.memcpy(addr.sun_path.at(0), path, sock.length.toCSize)
-          addr.sun_path(sock.length) = 0.toByte // null-terminate the path
-          val errConn = socket.connect(clientFd, addr.asInstanceOf[Ptr[socket.sockaddr]], sizeOf[un.sockaddr_un].toUInt)
-          if (errConn < 0 && errno.errno != perrno.EINPROGRESS) {
-            throw new IOException(s"Failed to connect socket: ${fromCString(string.strerror(errno.errno))}")
-          }
-        }
-        println(s"connection in progress to path: $sock")
         val polledEvents = stackalloc[event.kevent](255)
         var doPoll = true
         object state {
@@ -93,15 +55,12 @@ object KQueueExampleSocket {
         val message = "Hello from Scala Native KQueue Example!\n"
         while (doPoll) {
           println("starting to poll...")
-          val events = event.kevent(kq, null, 0, polledEvents, 255, null) // infinite wait
-          if (events < 0) {
-            throw new IOException(s"Failed to poll events: ${fromCString(string.strerror(perrno.errno))}")
-          }
+          val events = KqueueLoop.pollEventsForever(kq, polledEvents, 255)
           if (events == 0) {
             println("No events polled, continuing...")
           } else {
             var i = 0
-            while (i < events) {
+            while (i < events && doPoll) {
               val evt = polledEvents + i
               if (evt.filter == event.EVFILT_WRITE) {
                 assert(evt.ident.toInt == clientFd, "Unexpected file descriptor for write event.")
@@ -168,14 +127,6 @@ object KQueueExampleSocket {
             }
           }
         }
-      } finally {
-        if (unistd.close(clientFd) < 0) {
-          throw new IOException(s"Failed to close client socket: ${fromCString(string.strerror(perrno.errno))}")
-        }
-      }
-    } finally {
-      if (unistd.close(kq) < 0) {
-        throw new IOException(s"Failed to close kqueue: ${fromCString(string.strerror(perrno.errno))}")
       }
     }
   }
