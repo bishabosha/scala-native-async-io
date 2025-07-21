@@ -16,7 +16,7 @@ import scala.scalanative.posix.string
 import scala.scalanative.annotation.alwaysinline
 
 object PosixSockets {
-  def open(flavor: Flavor, transport: Transport, blocking: Boolean): Int = {
+  def open(flavor: Flavor, transport: Transport): Int = {
     val posixFlavor = flavor match {
       case Flavor.Unix  => socket.AF_UNIX
       case Flavor.IPv4  => socket.AF_INET
@@ -32,15 +32,22 @@ object PosixSockets {
         s"Failed to open socket: ${cError()}"
       )
     }
-    if (!blocking && fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.O_NONBLOCK) < 0) {
+    fd
+  }
+
+  def setNonBlocking(fd: Int): Unit = {
+    if (fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.O_NONBLOCK) < 0) {
       throw new IOException(
         s"Failed to set socket descriptor to non-blocking: ${cError()}"
       )
     }
-    fd
   }
 
   def maxConnections: Int = socket.SOMAXCONN
+
+  @alwaysinline
+  private def unixSocketAddrLen: socket.socklen_t =
+    sizeOf[un.sockaddr_un].toUInt
 
   def bindUnixAddr(fd: Int, sock: String, removeExisting: Boolean): Unit = {
     Sockets.checkUnixPathLength(sock)
@@ -50,7 +57,7 @@ object PosixSockets {
         PosixFileOps.safeUnlink(path) // Ensure the socket path is clean before binding
       }
       val addr = createUnixSocketAddr(path, sock.length)
-      val err = socket.bind(fd, addr, sizeOf[un.sockaddr_un].toUInt)
+      val err = socket.bind(fd, addr, unixSocketAddrLen)
       if (err < 0) {
         throw new IOException(
           s"Failed to bind socket: ${cError()}"
@@ -72,16 +79,34 @@ object PosixSockets {
     Zone.acquire { implicit z =>
       val path = toCString(sock)
       val addr = createUnixSocketAddr(path, sock.length)
-      val err = socket.connect(fd, addr, sizeOf[un.sockaddr_un].toUInt)
+      val err = socket.connect(fd, addr, unixSocketAddrLen)
       if (err < 0 && errno.errno != errno.EINPROGRESS) {
         throw new IOException(s"Failed to connect socket: ${cError()}")
       }
     }
   }
 
+  /** Accept a Unix domain socket connection.
+   *
+   * If the socket is non-blocking, it will throw if a connection is un-available. Use within an
+   * event loop to be notified when a connection is available.
+   */
+  def acceptUnix(fd: Int): Int = {
+    val clientFd = socket.accept(fd, null, null)
+    if (clientFd < 0) {
+      if (errno.errno == errno.EAGAIN || errno.errno == errno.EWOULDBLOCK)
+        // TODO: perhaps between the event and calling accept the socket was closed?
+        // So test this.
+        throw new IOException("No pending connections to accept")
+      else
+        throw new IOException(s"Failed to accept connection: ${cError()}")
+    }
+    clientFd
+  }
+
   @alwaysinline
   private def createUnixSocketAddr(path: CString, length: Int)(implicit z: Zone): Ptr[socket.sockaddr] = {
-    val addr = z.alloc(sizeOf[un.sockaddr_un]).asInstanceOf[Ptr[un.sockaddr_un]]
+    val addr = alloc[un.sockaddr_un]()
     addr.sun_family = socket.AF_UNIX.toUShort
     string.memcpy(addr.sun_path.at(0), path, length.toCSize)
     addr.sun_path(length) = 0.toByte // null-terminate the path

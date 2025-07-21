@@ -1,6 +1,7 @@
 package asyncio.unsafe
 
 import asyncio.scalanative.bsd.sys.event
+import asyncio.scalanative.bsd.sys.event.kevent.{*, given}
 import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.{*, given}
 import scala.scalanative.posix.string
@@ -11,8 +12,45 @@ import scala.scalanative.posix.timeOps.*
 import java.io.IOException
 import scala.scalanative.unsigned.USize
 import PosixErr.cError
+import scala.scalanative.annotation.alwaysinline
 
 object KqueueLoop {
+
+  type Event = Ptr[event.kevent]
+
+  def debugEvent(evt: Ptr[event.kevent]): Unit = {
+    println(s"kevent{ident=${evt.ident}, filter=${evt.filter}, flags=${evt.flags}, fflags=${evt.fflags}, data=${evt.data}, udata=${evt.udata}}")
+  }
+
+  @alwaysinline
+  def isError(evt: Ptr[event.kevent]): Boolean = {
+    (evt.flags & event.EV_ERROR) != 0
+  }
+  @alwaysinline
+  def errno(evt: Ptr[event.kevent]): CInt = {
+    evt.data.toInt
+  }
+  @alwaysinline
+  def rwAvailable(evt: Ptr[event.kevent]): CInt = {
+    evt.data.toInt
+  }
+  @alwaysinline
+  def isReadEvent(evt: Ptr[event.kevent]): Boolean = {
+    evt.filter == event.EVFILT_READ
+  }
+  @alwaysinline
+  def isWriteEvent(evt: Ptr[event.kevent]): Boolean = {
+    evt.filter == event.EVFILT_WRITE
+  }
+  def fileIdent(evt: Ptr[event.kevent]): Int = {
+    evt.ident.toInt
+  }
+
+  @alwaysinline
+  def pollQueue(nevents: Int)(op: Ptr[event.kevent] => Unit): Unit = {
+    val events = stackalloc[event.kevent](nevents)
+    op(events)
+  }
 
   def addTimerOneShot(evt: Ptr[event.kevent], id: USize, unit: CUnsignedInt, length: Size): Unit = {
     event.EV_SET(
@@ -57,8 +95,8 @@ object KqueueLoop {
   def createAndRegisterEvents(
       kq: Int,
       nEvents: Int
-  )(f: Ptr[event.kevent] => Unit): Unit = Zone.acquire { implicit z =>
-    val events = z.alloc(sizeOf[event.kevent] * nEvents).asInstanceOf[Ptr[event.kevent]]
+  )(f: Ptr[event.kevent] => Unit): Unit = {
+    val events = stackalloc[event.kevent](nEvents)
     f(events)
     registerEvents(kq, events, nEvents)
   }
