@@ -15,6 +15,7 @@ import scala.scalanative.unsafe.Tag.USize
 import scala.scalanative.posix.time.timespec
 import scala.scalanative.unsafe.name
 import scala.scalanative.unsafe.blocking
+import scala.scalanative.annotation.alwaysinline
 
 @extern
 object event {
@@ -37,19 +38,31 @@ object event {
   ]
 
   object kevent {
-    implicit final class KEventOps(val event: Ptr[kevent]) extends AnyVal {
+    implicit final class KEventOps (val event: Ptr[kevent]) extends AnyVal {
+      @alwaysinline
       def ident: USize = event._1
+      @alwaysinline
       def filter: CShort = event._2
+      @alwaysinline
       def flags: CUnsignedShort = event._3
+      @alwaysinline
       def fflags: CUnsignedInt = event._4
+      @alwaysinline
       def data: Size = event._5
+      @alwaysinline
       def udata: CVoidPtr = event._6
 
+      @alwaysinline
       def ident_=(value: USize): Unit = event._1 = value
+      @alwaysinline
       def filter_=(value: CShort): Unit = event._2 = value
+      @alwaysinline
       def flags_=(value: CUnsignedShort): Unit = event._3 = value
+      @alwaysinline
       def fflags_=(value: CUnsignedInt): Unit = event._4 = value
+      @alwaysinline
       def data_=(value: Size): Unit = event._5 = value
+      @alwaysinline
       def udata_=(value: CVoidPtr): Unit = event._6 = value
     }
   }
